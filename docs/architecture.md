@@ -44,6 +44,216 @@ The code sits on a small stack of well-documented Linux/GNOME components:
 Build dependencies on Ubuntu: `build-essential`, `pkg-config`, `libgtk-3-dev`,
 `openvpn`, `policykit-1` (see [README.md](../README.md)).
 
+The sections below explain **what each piece is**, **where it comes from**, and
+**trade-offs versus common alternatives**. This project’s choices are deliberate:
+a native Linux desktop tool that reuses system VPN and privilege mechanisms rather
+than shipping its own tunnel or auth stack.
+
+### GTK 3
+
+**What it is:** The **GIMP Toolkit**, a C library for building graphical user
+interfaces — windows, buttons, lists, text fields, menus, and the event loop that
+dispatches user input and redraws. This app uses **GTK 3** widgets (`GtkApplication`,
+`GtkListBox`, `GtkSearchEntry`, etc.) via `#include <gtk/gtk.h>`.
+
+**Where it comes from:** Maintained by the [GNOME project](https://www.gnome.org/) as
+part of the broader GTK/GObject ecosystem. On Ubuntu/Debian it is packaged as
+`libgtk-3-dev`; runtime libraries are usually already present on GNOME-based desktops.
+Documentation lives at [docs.gtk.org](https://docs.gtk.org/gtk3/).
+
+**Pros (for this project):**
+
+- Native look and behaviour on Linux desktops without bundling a runtime (unlike
+  Electron).
+- Mature, stable **GTK 3** API — well understood, widely packaged, no bleeding-edge
+  migration pressure from GTK 4.
+- Integrates naturally with **GLib/GIO** (same object model, main loop, async I/O).
+- Lightweight compared to embedding a browser engine; appropriate for a small utility.
+
+**Cons / alternatives:**
+
+| Alternative | Trade-off |
+|-------------|-----------|
+| **[Qt 6](https://www.qt.io/)** | Excellent cross-platform UI and tooling; heavier dependency, different licensing history (LGPL/commercial), and a separate event loop/model from GLib. Common choice when Windows/macOS matter equally. |
+| **[GTK 4 / Libadwaita](https://gtk.org/)** | Modern GNOME stack and styling; API and packaging churn, more opinionated “GNOME app” patterns. Reasonable for new GNOME-only apps; this project stayed on GTK 3 for stability. |
+| **[Electron / Tauri + web UI](https://www.electronjs.org/)** | Fast UI iteration if you know web tech; large memory footprint, not “native Linux”, and poor fit for tight integration with `pkexec`, Unix sockets, and system OpenVPN. |
+| **No GUI (CLI only)** | Simplest deploy; fails the product goal of search/select for hundreds of profiles. |
+
+### GLib
+
+**What it is:** A low-level **C utility library** from the GNOME stack: dynamic strings
+(`GString`, `gchar*`), hash tables, linked lists, **`GPtrArray`**, regular expressions
+(`GRegex`), INI/config parsing (`GKeyFile`), the **main event loop**, threads, and
+timers. Most “nice to use” C helpers in this codebase (`g_strdup`, `g_strsplit`,
+`g_timeout_add`) come from GLib.
+
+**Where it comes from:** [GLib](https://docs.gtk.org/glib/) is maintained alongside GTK
+by GNOME. Ubuntu package: `libglib2.0-dev`. GLib is a hard dependency of GTK and GIO.
+
+**Pros:**
+
+- Consistent, battle-tested primitives so the project avoids reinventing string lists,
+  config parsing, and regex.
+- **Reference counting** and **`GError`** patterns integrate with GIO/GTK.
+- **`GMainLoop`** is the hub that drives GTK and async callbacks — one loop for UI,
+  socket readiness, and idle handlers.
+
+**Cons / alternatives:**
+
+| Alternative | Trade-off |
+|-------------|-----------|
+| **ISO C + POSIX only** | Fewer dependencies; you reimplement safe strings, growable arrays, regex, and config formats, or pull in several small libraries anyway. |
+| **[Apache APR](https://apr.apache.org/)** | Portable runtime used by Apache httpd; less idiomatic on Linux desktops and no GTK integration. |
+| **C++ STL / [Rust std](https://doc.rust-lang.org/std/)** | Richer language ecosystems; this project is **C11** by design for minimal runtime and direct GLib/GTK interop. |
+| **[SQLite](https://www.sqlite.org/) for config** | Strong for structured data; overkill for a small INI file and credential rules. `GKeyFile` matches the existing `config.ini` format. |
+
+### GIO
+
+**What it is:** **GLib Input/Output** — higher-level OS services built on GLib: file and
+directory access (`GFile`, `GDir`), **subprocess** launch (`GSubprocess`), **Unix domain
+sockets** (`GSocketService`), cancellable async work (`GCancellable`, **`GTask`**), and
+stream-based async reads/writes. GIO is how the app scans directories in worker threads,
+spawns OpenVPN, and reads stdout/stderr without blocking the UI.
+
+**Where it comes from:** Part of GLib ([GIO reference](https://docs.gtk.org/gio/)),
+typically linked as `libgio-2.0`. Headers such as `<gio/gio.h>` and
+`<gio/gunixsocketaddress.h>` come from the `libglib2.0-dev` / GTK dev packages.
+
+**Pros:**
+
+- **Async-first** API matches GTK’s non-blocking requirement (`g_task_run_in_thread`,
+  `g_input_stream_read_async`).
+- Cross-platform abstractions (this app targets Linux only, but the APIs are familiar
+  to GNOME developers).
+- **`GSubprocess`** avoids shell invocation — argv arrays only, which matters for
+  security when launching `pkexec` and OpenVPN.
+
+**Cons / alternatives:**
+
+| Alternative | Trade-off |
+|-------------|-----------|
+| **Raw POSIX** (`fork`/`exec`, `read`, `socket`, `poll`) | Maximum control and minimal abstraction; more boilerplate, easier to get edge cases wrong (EINTR, partial reads, fd leaks). |
+| **[libuv](https://libuv.org/)** | Popular async I/O (Node.js backend); second event-loop model alongside GTK’s loop — awkward to combine. |
+| **Boost.Asio / standalone Asio** | Strong C++ networking; not applicable to this C codebase. |
+| **Synchronous `stdio` in GTK callbacks** | Simple to write; **freezes the UI** during scan/connect — explicitly rejected in the design. |
+
+### OpenVPN
+
+**What it is:** A widely deployed **open-source VPN daemon** that implements SSL/TLS
+tunnels using `.ovpn` profile files. This application does **not** embed VPN logic; it
+runs the system binary **`/usr/sbin/openvpn`** as a separate **root** process (via
+`pkexec`) and passes profile and auth-file paths as arguments.
+
+**Where it comes from:** [OpenVPN project](https://openvpn.net/community/) (community
+edition on Linux distros). Ubuntu package: `openvpn`. Profiles and credentials are
+administrator-supplied under `/etc/openvpn/`.
+
+**Pros:**
+
+- **De facto standard** for commercial VPN providers that ship `.ovpn` bundles (e.g.
+  NordVPN-style hostname-per-endpoint layouts).
+- Mature **management interface** and `--auth-user-pass` file format.
+- Reuses the same binary and profiles users may already trust and audit system-wide.
+
+**Cons / alternatives:**
+
+| Alternative | Trade-off |
+|-------------|-----------|
+| **[WireGuard](https://www.wireguard.com/)** (`wg-quick`, NetworkManager plugin) | Simpler modern crypto and kernel module; different config model (not `.ovpn`), often one peer per interface — poor match for hundreds of provider `.ovpn` files. |
+| **[OpenConnect](https://www.infradead.org/openconnect/)** | Good for Cisco AnyConnect-style servers; different protocol and profile format. |
+| **NetworkManager VPN plugins** | Integrated desktop UX; adds NM dependency and abstraction — explicitly out of scope for this “direct OpenVPN process” tool. |
+| **Proprietary vendor GUIs** | Turnkey for one provider; not a general manager for a directory of profiles. |
+
+### OpenVPN management interface
+
+**What it is:** A **text protocol** on a TCP or Unix socket where OpenVPN emits lines
+such as `>STATE:...,CONNECTED,...` and accepts commands like `state on`. With
+**`--management-client`**, OpenVPN connects **to** a socket owned by the GUI; when that
+socket closes, OpenVPN is documented to **exit** — which is how Disconnect works without
+signalling a root PID from an unprivileged app.
+
+**Where it comes from:** Built into OpenVPN; documented in the
+[management interface notes](https://openvpn.net/community-resources/management-interface/).
+This app creates a listener under `$XDG_RUNTIME_DIR` and passes the path with
+`--management <path> unix`.
+
+**Pros:**
+
+- Structured **connection state** without parsing all of stdout.
+- Clean **lifecycle coupling** for `--management-client` shutdown.
+- Well-known among OpenVPN automation (scripts, monitoring tools).
+
+**Cons / alternatives:**
+
+| Alternative | Trade-off |
+|-------------|-----------|
+| **Parse stdout/stderr only** | Works for “connected” heuristics (this app still watches log lines as a fallback); no reliable state machine, harder disconnect semantics. |
+| **D-Bus via NetworkManager** | Rich integration on NM-managed systems; not available for a standalone `pkexec openvpn` session. |
+| **Custom helper daemon** | Could expose a stable IPC API; more moving parts, install footprint, and security review — rejected in favour of OpenVPN’s built-in interface. |
+
+### PolicyKit and pkexec
+
+**What it is:** **PolicyKit (polkit)** is a framework for defining **who may perform
+privileged actions** on a Linux system. **`pkexec`** is a small helper that runs one
+command as root after the desktop **polkit agent** shows an authorization dialog (unless
+policy allows caching). Connect uses:
+
+```text
+pkexec /usr/sbin/openvpn ...
+```
+
+**Where it comes from:** [freedesktop.org](https://www.freedesktop.org/wiki/Software/polkit/)
+stack; Ubuntu packages `policykit-1` and a desktop agent (e.g. GNOME’s polkit dialog).
+No custom sudoers entry or setuid binary is installed by this app.
+
+**Pros:**
+
+- **Standard desktop pattern** for occasional root actions — familiar to users and
+  distros.
+- **No persistent setuid helper** or broad sudoers rule shipped with the app.
+- Authorization policy can be refined by administrators via polkit rules (outside
+  this repo).
+
+**Cons / alternatives:**
+
+| Alternative | Trade-off |
+|-------------|-----------|
+| **`sudo` + `/etc/sudoers.d`** | Simple for admins; easy to grant **too much** privilege; not a graphical consent flow by default; app would depend on site-specific sudo policy. |
+| **Custom setuid helper** | Full control over the API; high security maintenance burden (argument validation, privilege separation, updates). |
+| **Run entire GUI as root** | Avoids elevation at connect time; unacceptable attack surface for a tool that parses files and renders untrusted strings. |
+| **Capabilities (`cap_net_admin`)** without full root | Possible for some tunnel setups; OpenVPN’s traditional model and `pkexec` path expect root for routing/TUN — not pursued here. |
+
+**Note:** Whether `pkexec` prompts every time or caches approval is **session/policy
+dependent**; the app does not control that.
+
+### XDG Base Directory specification
+
+**What it is:** A **freedesktop convention** for where user-specific files live:
+
+- **`$XDG_CONFIG_HOME`** (default `~/.config`) — config, e.g.
+  `~/.config/openvpn-manager/config.ini`
+- **`$XDG_RUNTIME_DIR`** (default `/run/user/<uid>`) — session-private dir for runtime
+  files, used for the per-session management socket directory
+
+Accessed via GLib: `g_get_user_config_dir()`, `g_get_user_runtime_dir()`.
+
+**Where it comes from:** [XDG Base Directory Specification](https://specifications.freedesktop.org/basedir-spec/basedir-spec-latest.html)
+(freedesktop.org). Implemented by GLib and respected by most Linux desktop software.
+
+**Pros:**
+
+- Predictable paths across distributions; respects user overrides (e.g. relocated home).
+- **`XDG_RUNTIME_DIR`** is tmpfs, user-owned, and suited to short-lived socket paths.
+- Avoids cluttering `$HOME` with dot-directories ad hoc.
+
+**Cons / alternatives:**
+
+| Alternative | Trade-off |
+|-------------|-----------|
+| **Hardcoded `~/.openvpn-manager`** | Simple; ignores XDG and user `XDG_CONFIG_HOME`. |
+| **Windows `%APPDATA%` / macOS `Application Support`** | Required for cross-platform ports; irrelevant to this Ubuntu-focused build. |
+| **System-wide config in `/etc` only** | Fine for admin defaults; poor for per-user credential rules and last-connected state without multi-user conflicts. |
+
 ---
 
 ## Concepts for non-C / non-GTK developers
