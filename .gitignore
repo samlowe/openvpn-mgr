@@ -12,9 +12,9 @@ compile_commands.json
 *.swp
 *.swo
 .DS_Store
+__pycache__/
 
 # Agent hooks (local overrides and generated files)
 .claude/backups
 .claude/settings.local.json
-.claude/__pycache__/
 .stratacode/settings.local.json
