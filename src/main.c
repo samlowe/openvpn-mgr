@@ -14,6 +14,16 @@
 #define MAX_OUTPUT_LINE 8192U
 #define STOP_TIMEOUT_SECONDS 10U
 
+/**
+ * AppState:
+ * @APP_IDLE: no active OpenVPN session
+ * @APP_STARTING: launch in progress or awaiting connection
+ * @APP_CONNECTED: tunnel established
+ * @APP_STOPPING: disconnect requested
+ * @APP_ERROR: last operation failed
+ *
+ * High-level connection lifecycle state for the UI.
+ */
 typedef enum {
     APP_IDLE,
     APP_STARTING,
@@ -24,6 +34,17 @@ typedef enum {
 
 typedef struct _App App;
 
+/**
+ * LineReader:
+ * @stream: input stream being read incrementally
+ * @pending: bytes accumulated since the last complete line
+ * @app: owning application instance
+ * @management: %TRUE when reading the management interface
+ * @generation: session generation used to ignore stale callbacks
+ * @buffer: stack buffer passed to g_input_stream_read_async()
+ *
+ * Reads newline-delimited text asynchronously from an OpenVPN stream.
+ */
 typedef struct {
     GInputStream *stream;
     GByteArray *pending;
@@ -33,16 +54,39 @@ typedef struct {
     guint8 buffer[READ_BUFFER_SIZE];
 } LineReader;
 
+/**
+ * ScanInput:
+ * @config_path: path to the manager config file
+ *
+ * Input payload for the profile scan background task.
+ */
 typedef struct {
     gchar *config_path;
 } ScanInput;
 
+/**
+ * ScanResult:
+ * @config: loaded application configuration
+ * @profiles: scanned and mapped profiles
+ * @last_connected_path: persisted last-connected profile path
+ *
+ * Output payload from the profile scan background task.
+ */
 typedef struct {
     AppConfig *config;
     GPtrArray *profiles;
     gchar *last_connected_path;
 } ScanResult;
 
+/**
+ * FilterInput:
+ * @profiles: profiles to search
+ * @query: case-insensitive filter string
+ * @default_path: last-connected profile path to promote in results
+ * @generation: filter generation used to ignore stale callbacks
+ *
+ * Input payload for the profile filter background task.
+ */
 typedef struct {
     GPtrArray *profiles;
     gchar *query;
@@ -50,24 +94,53 @@ typedef struct {
     guint generation;
 } FilterInput;
 
+/**
+ * FilterResult:
+ * @source_profiles: referenced source profile array
+ * @matches: profiles matching the query, truncated for display
+ * @total_matches: total matches before truncation
+ *
+ * Output payload from the profile filter background task.
+ */
 typedef struct {
     GPtrArray *source_profiles;
     GPtrArray *matches;
     guint total_matches;
 } FilterResult;
 
+/**
+ * LaunchInput:
+ * @profile_path: OpenVPN profile to connect
+ * @auth_path: credentials file for the profile
+ * @management_socket: Unix socket path for OpenVPN management
+ *
+ * Input payload for the OpenVPN launch background task.
+ */
 typedef struct {
     gchar *profile_path;
     gchar *auth_path;
     gchar *management_socket;
 } LaunchInput;
 
+/**
+ * StateSaveInput:
+ * @directory: directory containing the state file
+ * @state_path: path to the last-connected state file
+ * @profile_path: profile path to persist
+ *
+ * Input payload for the asynchronous state save task.
+ */
 typedef struct {
     gchar *directory;
     gchar *state_path;
     gchar *profile_path;
 } StateSaveInput;
 
+/**
+ * App:
+ *
+ * GTK application state: profile list, active session, and management socket.
+ */
 struct _App {
     GtkApplication *application;
     GtkWidget *window;
@@ -111,17 +184,91 @@ static LineReader *line_reader_new(App *app, GInputStream *stream,
 static void process_wait_complete(GObject *source_object, GAsyncResult *result,
                                   gpointer user_data);
 
+/**
+ * user_config_path:
+ * @filename: basename within the openvpn-manager config directory
+ *
+ * Returns: (transfer full): path to a file under $XDG_CONFIG_HOME/openvpn-manager
+ */
+static gchar *user_config_path(const gchar *filename)
+{
+    return g_build_filename(g_get_user_config_dir(), "openvpn-manager",
+                            filename, NULL);
+}
+
+/**
+ * config_path:
+ *
+ * Returns: (transfer full): path to the manager config file
+ */
+static gchar *config_path(void)
+{
+    return user_config_path("config.ini");
+}
+
+/**
+ * state_path:
+ *
+ * Returns: (transfer full): path to the last-connected profile state file
+ */
+static gchar *state_path(void)
+{
+    return user_config_path("state.ini");
+}
+
+/**
+ * load_last_connected_path:
+ *
+ * Reads the last successfully connected profile path from persistent state.
+ *
+ * Returns: (nullable): absolute profile path, or %NULL when missing/invalid
+ */
+static gchar *load_last_connected_path(void)
+{
+    gchar *path = state_path();
+    gchar *contents = NULL;
+    GError *error = NULL;
+    if (!g_file_get_contents(path, &contents, NULL, &error)) {
+        g_clear_error(&error);
+        g_free(path);
+        return NULL;
+    }
+    g_free(path);
+    g_strstrip(contents);
+    if (!g_path_is_absolute(contents) || *contents == '\0') {
+        g_free(contents);
+        return NULL;
+    }
+    return contents;
+}
+
+/**
+ * app_set_status:
+ * @app: application instance
+ * @text: status line to display
+ */
 static void app_set_status(App *app, const gchar *text)
 {
     gtk_label_set_text(GTK_LABEL(app->status_label), text);
 }
 
+/**
+ * set_state:
+ * @app: application instance
+ * @state: new high-level connection state
+ */
 static void set_state(App *app, AppState state)
 {
     app->state = state;
     app_update_buttons(app);
 }
 
+/**
+ * app_update_buttons:
+ * @app: application instance
+ *
+ * Enables or disables Connect and Disconnect based on session state.
+ */
 static void app_update_buttons(App *app)
 {
     gboolean active = app->process != NULL || app->launching;
@@ -133,39 +280,10 @@ static void app_update_buttons(App *app)
     gtk_widget_set_sensitive(app->disconnect_button, active);
 }
 
-static gchar *config_path(void)
-{
-    return g_build_filename(g_get_user_config_dir(), "openvpn-manager",
-                            "config.ini", NULL);
-}
-
-static gchar *state_path(void)
-{
-    return g_build_filename(g_get_user_config_dir(), "openvpn-manager",
-                            "state.ini", NULL);
-}
-
-static gchar *load_last_connected_path(void)
-{
-    gchar *path = state_path();
-    gchar *contents = NULL;
-    gsize length = 0;
-    GError *error = NULL;
-    if (!g_file_get_contents(path, &contents, &length, &error)) {
-        g_clear_error(&error);
-        g_free(path);
-        return NULL;
-    }
-    g_free(path);
-    g_strstrip(contents);
-    if (!g_path_is_absolute(contents) || *contents == '\0') {
-        g_free(contents);
-        return NULL;
-    }
-    (void) length;
-    return contents;
-}
-
+/**
+ * scan_input_free:
+ * @input: (nullable): scan task input
+ */
 static void scan_input_free(ScanInput *input)
 {
     if (input == NULL) {
@@ -175,6 +293,10 @@ static void scan_input_free(ScanInput *input)
     g_free(input);
 }
 
+/**
+ * scan_result_free:
+ * @result: (nullable): scan task result
+ */
 static void scan_result_free(ScanResult *result)
 {
     if (result == NULL) {
@@ -186,6 +308,12 @@ static void scan_result_free(ScanResult *result)
     g_free(result);
 }
 
+/**
+ * scan_worker:
+ *
+ * Background task that loads config, restores last-connected state, and scans
+ * the profile directory.
+ */
 static void scan_worker(GTask *task, gpointer source_object, gpointer task_data,
                         GCancellable *cancellable)
 {
@@ -210,6 +338,12 @@ static void scan_worker(GTask *task, gpointer source_object, gpointer task_data,
     g_task_return_pointer(task, result, (GDestroyNotify) scan_result_free);
 }
 
+/**
+ * clear_list_box:
+ * @app: application instance
+ *
+ * Removes all rows from the profile list box.
+ */
 static void clear_list_box(App *app)
 {
     GList *children = gtk_container_get_children(GTK_CONTAINER(app->list_box));
@@ -219,6 +353,12 @@ static void clear_list_box(App *app)
     g_list_free(children);
 }
 
+/**
+ * update_selected_profile:
+ * @app: application instance
+ *
+ * Updates @app selected profile from the current list box selection.
+ */
 static void update_selected_profile(App *app)
 {
     GtkListBoxRow *row = gtk_list_box_get_selected_row(GTK_LIST_BOX(app->list_box));
@@ -227,6 +367,11 @@ static void update_selected_profile(App *app)
     app_update_buttons(app);
 }
 
+/**
+ * row_selected:
+ *
+ * GTK callback invoked when the profile list selection changes.
+ */
 static void row_selected(GtkListBox *list_box, GtkListBoxRow *row, gpointer data)
 {
     (void) list_box;
@@ -234,6 +379,14 @@ static void row_selected(GtkListBox *list_box, GtkListBoxRow *row, gpointer data
     update_selected_profile(data);
 }
 
+/**
+ * profile_row:
+ * @profile: profile to display
+ *
+ * Builds a list box row showing profile name, hostname, and status.
+ *
+ * Returns: (transfer full): new list box row widget
+ */
 static GtkWidget *profile_row(Profile *profile)
 {
     GtkWidget *row = gtk_list_box_row_new();
@@ -269,6 +422,14 @@ static GtkWidget *profile_row(Profile *profile)
     return row;
 }
 
+/**
+ * show_filter_result:
+ * @app: application instance
+ * @result: filtered profile results
+ * @generation: filter generation that must match to update the UI
+ *
+ * Repopulates the profile list from a completed filter task.
+ */
 static void show_filter_result(App *app, FilterResult *result, guint generation)
 {
     if (generation != app->filter_generation) {
@@ -304,6 +465,10 @@ static void show_filter_result(App *app, FilterResult *result, guint generation)
     }
 }
 
+/**
+ * filter_input_free:
+ * @input: (nullable): filter task input
+ */
 static void filter_input_free(FilterInput *input)
 {
     if (input == NULL) {
@@ -315,6 +480,10 @@ static void filter_input_free(FilterInput *input)
     g_free(input);
 }
 
+/**
+ * filter_result_free:
+ * @result: (nullable): filter task result
+ */
 static void filter_result_free(FilterResult *result)
 {
     if (result == NULL) {
@@ -325,43 +494,67 @@ static void filter_result_free(FilterResult *result)
     g_free(result);
 }
 
+/**
+ * promote_default_profile:
+ * @matches: visible filtered profile list to reorder
+ * @profiles: full source profile list
+ * @default_path: last-connected profile path
+ * @query: active search query
+ *
+ * Moves the last-connected profile to the top of @matches when it matches @query.
+ */
+static void promote_default_profile(GPtrArray *matches, GPtrArray *profiles,
+                                    const gchar *default_path, const gchar *query)
+{
+    Profile *default_profile = NULL;
+    for (guint index = 0; index < profiles->len; index++) {
+        Profile *profile = g_ptr_array_index(profiles, index);
+        if (g_strcmp0(profile->path, default_path) == 0 &&
+            profile_matches(profile, query)) {
+            default_profile = profile;
+            break;
+        }
+    }
+    if (default_profile == NULL) {
+        return;
+    }
+    guint visible_index = G_MAXUINT;
+    for (guint index = 0; index < matches->len; index++) {
+        if (g_ptr_array_index(matches, index) == default_profile) {
+            visible_index = index;
+            break;
+        }
+    }
+    if (visible_index != G_MAXUINT && visible_index != 0U) {
+        g_ptr_array_remove_index(matches, visible_index);
+        g_ptr_array_insert(matches, 0, default_profile);
+    } else if (visible_index == G_MAXUINT && matches->len > 0U) {
+        g_ptr_array_index(matches, 0) = default_profile;
+    }
+}
+
+/**
+ * filter_worker:
+ *
+ * Background task that filters the profile list and promotes the last-connected
+ * profile to the top of visible results when it matches the query.
+ */
 static void filter_worker(GTask *task, gpointer source_object, gpointer task_data,
                           GCancellable *cancellable)
 {
     (void) source_object;
-    (void) cancellable;
     FilterInput *input = task_data;
     FilterResult *result = g_new0(FilterResult, 1);
     result->source_profiles = g_ptr_array_ref(input->profiles);
     result->matches = profiles_filter_cancelable(
         input->profiles, input->query, MAX_VISIBLE_RESULTS, cancellable,
         &result->total_matches);
+
     if (result->matches != NULL && input->default_path != NULL) {
-        Profile *default_profile = NULL;
-        for (guint index = 0; index < input->profiles->len; index++) {
-            Profile *profile = g_ptr_array_index(input->profiles, index);
-            if (g_strcmp0(profile->path, input->default_path) == 0 &&
-                profile_matches(profile, input->query)) {
-                default_profile = profile;
-                break;
-            }
-        }
-        if (default_profile != NULL) {
-            guint visible_index = G_MAXUINT;
-            for (guint index = 0; index < result->matches->len; index++) {
-                if (g_ptr_array_index(result->matches, index) == default_profile) {
-                    visible_index = index;
-                    break;
-                }
-            }
-            if (visible_index != G_MAXUINT && visible_index != 0U) {
-                g_ptr_array_remove_index(result->matches, visible_index);
-                g_ptr_array_insert(result->matches, 0, default_profile);
-            } else if (visible_index == G_MAXUINT && result->matches->len > 0U) {
-                g_ptr_array_index(result->matches, 0) = default_profile;
-            }
-        }
+        promote_default_profile(result->matches, input->profiles,
+                                input->default_path, input->query);
     }
+
     if (result->matches == NULL) {
         filter_result_free(result);
         g_task_return_new_error(task, G_IO_ERROR, G_IO_ERROR_CANCELLED,
@@ -371,6 +564,11 @@ static void filter_worker(GTask *task, gpointer source_object, gpointer task_dat
     g_task_return_pointer(task, result, (GDestroyNotify) filter_result_free);
 }
 
+/**
+ * filter_complete:
+ *
+ * GTK callback invoked when a profile filter background task finishes.
+ */
 static void filter_complete(GObject *source_object, GAsyncResult *result,
                             gpointer user_data)
 {
@@ -394,6 +592,14 @@ static void filter_complete(GObject *source_object, GAsyncResult *result,
     filter_result_free(filter_result);
 }
 
+/**
+ * start_filter:
+ * @data: application instance
+ *
+ * Starts a debounced profile filter task.
+ *
+ * Returns: %G_SOURCE_REMOVE
+ */
 static gboolean start_filter(gpointer data)
 {
     App *app = data;
@@ -415,6 +621,11 @@ static gboolean start_filter(gpointer data)
     return G_SOURCE_REMOVE;
 }
 
+/**
+ * search_changed:
+ *
+ * GTK callback invoked when the search entry text changes.
+ */
 static void search_changed(GtkEditable *editable, gpointer data)
 {
     (void) editable;
@@ -426,6 +637,11 @@ static void search_changed(GtkEditable *editable, gpointer data)
     app->filter_timeout_id = g_timeout_add(120U, start_filter, app);
 }
 
+/**
+ * scan_complete:
+ *
+ * GTK callback invoked when the initial profile scan finishes.
+ */
 static void scan_complete(GObject *source_object, GAsyncResult *result,
                           gpointer user_data)
 {
@@ -444,9 +660,13 @@ static void scan_complete(GObject *source_object, GAsyncResult *result,
         return;
     }
     app_config_clear(&app->config);
-    app->config = *scan_result->config;
-    g_free(scan_result->config);
+    AppConfig *loaded_config = scan_result->config;
     scan_result->config = NULL;
+    app->config.profile_directory = loaded_config->profile_directory;
+    app->config.credential_rules = loaded_config->credential_rules;
+    loaded_config->profile_directory = NULL;
+    loaded_config->credential_rules = NULL;
+    app_config_free(loaded_config);
     g_clear_pointer(&app->profiles, g_ptr_array_unref);
     app->profiles = scan_result->profiles;
     scan_result->profiles = NULL;
@@ -457,6 +677,14 @@ static void scan_complete(GObject *source_object, GAsyncResult *result,
     search_changed(NULL, app);
 }
 
+/**
+ * begin_scan:
+ * @data: application instance
+ *
+ * Starts the initial profile scan after window creation.
+ *
+ * Returns: %G_SOURCE_REMOVE
+ */
 static gboolean begin_scan(gpointer data)
 {
     App *app = data;
@@ -474,6 +702,10 @@ static gboolean begin_scan(gpointer data)
     return G_SOURCE_REMOVE;
 }
 
+/**
+ * line_reader_free:
+ * @reader: (nullable): line reader to destroy
+ */
 static void line_reader_free(LineReader *reader)
 {
     if (reader == NULL) {
@@ -484,6 +716,10 @@ static void line_reader_free(LineReader *reader)
     g_free(reader);
 }
 
+/**
+ * state_save_input_free:
+ * @input: (nullable): state save task input
+ */
 static void state_save_input_free(StateSaveInput *input)
 {
     if (input == NULL) {
@@ -495,6 +731,11 @@ static void state_save_input_free(StateSaveInput *input)
     g_free(input);
 }
 
+/**
+ * save_state_worker:
+ *
+ * Background task that persists the last-connected profile path.
+ */
 static void save_state_worker(GTask *task, gpointer source_object, gpointer task_data,
                               GCancellable *cancellable)
 {
@@ -508,6 +749,12 @@ static void save_state_worker(GTask *task, gpointer source_object, gpointer task
     g_task_return_boolean(task, saved);
 }
 
+/**
+ * save_last_connected_path:
+ * @app: application instance
+ *
+ * Asynchronously writes the active profile path to persistent state.
+ */
 static void save_last_connected_path(App *app)
 {
     if (app->active_profile == NULL) {
@@ -524,6 +771,15 @@ static void save_last_connected_path(App *app)
     g_object_unref(task);
 }
 
+/**
+ * process_openvpn_line:
+ * @app: application instance
+ * @line: single line of OpenVPN stdout, stderr, or management output
+ * @management: %TRUE when @line came from the management interface
+ * @generation: session generation that must match to apply updates
+ *
+ * Updates connection status from OpenVPN log and management state events.
+ */
 static void process_openvpn_line(App *app, const gchar *line, gboolean management,
                                  guint generation)
 {
@@ -556,6 +812,11 @@ static void process_openvpn_line(App *app, const gchar *line, gboolean managemen
 
 static void line_reader_read(LineReader *reader);
 
+/**
+ * line_reader_read_complete:
+ *
+ * Async read callback that extracts complete lines from OpenVPN output.
+ */
 static void line_reader_read_complete(GObject *source_object, GAsyncResult *result,
                                        gpointer user_data)
 {
@@ -596,6 +857,12 @@ static void line_reader_read_complete(GObject *source_object, GAsyncResult *resu
     line_reader_read(reader);
 }
 
+/**
+ * line_reader_read:
+ * @reader: line reader to feed
+ *
+ * Starts or continues asynchronous reads from @reader stream.
+ */
 static void line_reader_read(LineReader *reader)
 {
     g_input_stream_read_async(reader->stream, reader->buffer, READ_BUFFER_SIZE,
@@ -603,6 +870,16 @@ static void line_reader_read(LineReader *reader)
                               line_reader_read_complete, reader);
 }
 
+/**
+ * line_reader_new:
+ * @app: owning application instance
+ * @stream: input stream to read from
+ * @management: %TRUE when reading the management interface
+ *
+ * Creates a line reader and starts reading from @stream.
+ *
+ * Returns: (transfer full): new line reader
+ */
 static LineReader *line_reader_new(App *app, GInputStream *stream,
                                    gboolean management)
 {
@@ -616,6 +893,11 @@ static LineReader *line_reader_new(App *app, GInputStream *stream,
     return reader;
 }
 
+/**
+ * management_write_complete:
+ *
+ * Ignores completion of a management interface write.
+ */
 static void management_write_complete(GObject *source_object, GAsyncResult *result,
                                        gpointer user_data)
 {
@@ -629,6 +911,11 @@ static void management_write_complete(GObject *source_object, GAsyncResult *resu
     g_clear_error(&error);
 }
 
+/**
+ * stream_close_complete:
+ *
+ * Ignores completion of an asynchronous stream close.
+ */
 static void stream_close_complete(GObject *source_object, GAsyncResult *result,
                                   gpointer user_data)
 {
@@ -638,12 +925,22 @@ static void stream_close_complete(GObject *source_object, GAsyncResult *result,
     g_clear_error(&error);
 }
 
+/**
+ * close_stream_async:
+ * @stream: stream to close without blocking the main loop
+ */
 static void close_stream_async(GIOStream *stream)
 {
     g_io_stream_close_async(stream, G_PRIORITY_DEFAULT, NULL,
                             stream_close_complete, NULL);
 }
 
+/**
+ * management_connection_close:
+ * @app: application instance
+ *
+ * Closes the active management connection and stops its socket service.
+ */
 static void management_connection_close(App *app)
 {
     if (app->management_connection != NULL) {
@@ -656,6 +953,11 @@ static void management_connection_close(App *app)
     }
 }
 
+/**
+ * management_incoming:
+ *
+ * Accepts the OpenVPN management interface connection and enables state events.
+ */
 static gboolean management_incoming(GSocketService *service,
                                      GSocketConnection *connection,
                                      GObject *source_object, gpointer user_data)
@@ -679,6 +981,12 @@ static gboolean management_incoming(GSocketService *service,
     return TRUE;
 }
 
+/**
+ * remove_management_socket:
+ * @app: application instance
+ *
+ * Tears down the management socket and its private runtime directory.
+ */
 static void remove_management_socket(App *app)
 {
     management_connection_close(app);
@@ -692,6 +1000,15 @@ static void remove_management_socket(App *app)
     }
 }
 
+/**
+ * create_management_socket:
+ * @app: application instance
+ * @error: return location for a #GError
+ *
+ * Creates a private runtime directory and Unix management socket for OpenVPN.
+ *
+ * Returns: %TRUE on success
+ */
 static gboolean create_management_socket(App *app, GError **error)
 {
     const gchar *runtime = g_get_user_runtime_dir();
@@ -735,6 +1052,11 @@ static gboolean create_management_socket(App *app, GError **error)
     return TRUE;
 }
 
+/**
+ * process_wait_complete:
+ *
+ * GTK callback invoked when the OpenVPN subprocess exits.
+ */
 static void process_wait_complete(GObject *source_object, GAsyncResult *result,
                                   gpointer user_data)
 {
@@ -767,6 +1089,14 @@ static void process_wait_complete(GObject *source_object, GAsyncResult *result,
     }
 }
 
+/**
+ * stop_timeout:
+ * @data: application instance
+ *
+ * Forces OpenVPN to exit when a graceful stop takes too long.
+ *
+ * Returns: %G_SOURCE_REMOVE
+ */
 static gboolean stop_timeout(gpointer data)
 {
     App *app = data;
@@ -783,6 +1113,12 @@ static gboolean stop_timeout(gpointer data)
     return G_SOURCE_REMOVE;
 }
 
+/**
+ * app_request_disconnect:
+ * @app: application instance
+ *
+ * Begins stopping the active or launching OpenVPN session.
+ */
 static void app_request_disconnect(App *app)
 {
     if (app->process == NULL && !app->launching) {
@@ -800,6 +1136,10 @@ static void app_request_disconnect(App *app)
     }
 }
 
+/**
+ * launch_input_free:
+ * @input: (nullable): launch task input
+ */
 static void launch_input_free(LaunchInput *input)
 {
     if (input == NULL) {
@@ -811,6 +1151,11 @@ static void launch_input_free(LaunchInput *input)
     g_free(input);
 }
 
+/**
+ * launch_worker:
+ *
+ * Background task that spawns OpenVPN via pkexec.
+ */
 static void launch_worker(GTask *task, gpointer source_object, gpointer task_data,
                           GCancellable *cancellable)
 {
@@ -841,6 +1186,11 @@ static void launch_worker(GTask *task, gpointer source_object, gpointer task_dat
     g_task_return_pointer(task, process, g_object_unref);
 }
 
+/**
+ * launch_complete:
+ *
+ * GTK callback invoked when OpenVPN launch finishes.
+ */
 static void launch_complete(GObject *source_object, GAsyncResult *result,
                             gpointer user_data)
 {
@@ -870,6 +1220,11 @@ static void launch_complete(GObject *source_object, GAsyncResult *result,
     }
 }
 
+/**
+ * connect_clicked:
+ *
+ * GTK callback invoked when Connect is pressed.
+ */
 static void connect_clicked(GtkButton *button, gpointer data)
 {
     (void) button;
@@ -900,12 +1255,22 @@ static void connect_clicked(GtkButton *button, gpointer data)
     g_object_unref(task);
 }
 
+/**
+ * disconnect_clicked:
+ *
+ * GTK callback invoked when Disconnect is pressed.
+ */
 static void disconnect_clicked(GtkButton *button, gpointer data)
 {
     (void) button;
     app_request_disconnect(data);
 }
 
+/**
+ * window_delete_event:
+ *
+ * GTK callback that disconnects before closing when a session is active.
+ */
 static gboolean window_delete_event(GtkWidget *widget, GdkEvent *event, gpointer data)
 {
     (void) widget;
@@ -919,6 +1284,11 @@ static gboolean window_delete_event(GtkWidget *widget, GdkEvent *event, gpointer
     return FALSE;
 }
 
+/**
+ * activate:
+ *
+ * GTK application activate handler that creates the main window.
+ */
 static void activate(GtkApplication *application, gpointer user_data)
 {
     App *app = user_data;
@@ -976,6 +1346,12 @@ static void activate(GtkApplication *application, gpointer user_data)
     g_timeout_add(50U, begin_scan, app);
 }
 
+/**
+ * app_cleanup:
+ * @app: application instance
+ *
+ * Releases resources owned by @app at shutdown.
+ */
 static void app_cleanup(App *app)
 {
     if (app->filter_timeout_id != 0U) {
@@ -999,6 +1375,11 @@ static void app_cleanup(App *app)
     app_config_clear(&app->config);
 }
 
+/**
+ * main:
+ *
+ * Entry point: runs the GTK application event loop.
+ */
 int main(int argc, char **argv)
 {
     (void) argv;

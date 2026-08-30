@@ -10,7 +10,8 @@
 #include <unistd.h>
 #include <glib/gstdio.h>
 
-#define DEFAULT_PROFILE_DIRECTORY "/etc/openvpn/ovpn_udp"
+#define OPENVPN_ETC_PREFIX "/etc/openvpn/"
+#define DEFAULT_PROFILE_DIRECTORY OPENVPN_ETC_PREFIX "ovpn_udp"
 #define MAX_PROFILE_BYTES (1024U * 1024U)
 #define MAX_PROFILE_LINE_BYTES 8192U
 #define MAX_PROFILE_COUNT 50000U
@@ -76,6 +77,18 @@ void app_config_free(AppConfig *config)
     g_free(config);
 }
 
+/**
+ * get_required_key:
+ * @key_file: loaded key file
+ * @group: config group name
+ * @key: key name within @group
+ * @value: (out): loaded non-empty value on success
+ * @error: return location for a #GError
+ *
+ * Reads a required, non-empty string value from @key_file.
+ *
+ * Returns: %TRUE on success
+ */
 static gboolean get_required_key(GKeyFile *key_file, const gchar *group,
                                  const gchar *key, gchar **value, GError **error)
 {
@@ -104,6 +117,11 @@ gboolean app_config_load(AppConfig *config, const gchar *path, GError **error)
     GError *local_error = NULL;
     gchar *file_data = NULL;
     gsize file_length = 0;
+    GString *key_file_data = NULL;
+    gchar *profile_directory = NULL;
+    gchar **groups = NULL;
+    GPtrArray *rules = NULL;
+
     if (!g_file_get_contents(path, &file_data, &file_length, &local_error)) {
         if (g_error_matches(local_error, G_FILE_ERROR, G_FILE_ERROR_NOENT)) {
             g_clear_error(&local_error);
@@ -111,10 +129,9 @@ gboolean app_config_load(AppConfig *config, const gchar *path, GError **error)
             return TRUE;
         }
         g_propagate_error(error, local_error);
-        g_key_file_unref(key_file);
-        return FALSE;
+        goto fail;
     }
-    GString *key_file_data = g_string_sized_new(file_length);
+    key_file_data = g_string_sized_new(file_length);
     gchar **config_lines = g_strsplit(file_data, "\n", -1);
     for (gsize line_index = 0; config_lines[line_index] != NULL; line_index++) {
         gchar *line = g_strdup(config_lines[line_index]);
@@ -131,31 +148,26 @@ gboolean app_config_load(AppConfig *config, const gchar *path, GError **error)
                                    key_file_data->len, G_KEY_FILE_NONE,
                                    &local_error)) {
         g_propagate_error(error, local_error);
-        g_string_free(key_file_data, TRUE);
-        g_key_file_unref(key_file);
-        return FALSE;
+        goto fail;
     }
     g_string_free(key_file_data, TRUE);
+    key_file_data = NULL;
 
-    gchar *profile_directory = NULL;
     if (g_key_file_has_key(key_file, "manager", "profile-directory", NULL)) {
         if (!get_required_key(key_file, "manager", "profile-directory",
                               &profile_directory, error)) {
-            g_key_file_unref(key_file);
-            return FALSE;
+            goto fail;
         }
         if (!g_path_is_absolute(profile_directory)) {
             g_set_error(error, G_KEY_FILE_ERROR, G_KEY_FILE_ERROR_INVALID_VALUE,
                         "profile-directory must be absolute");
-            g_free(profile_directory);
-            g_key_file_unref(key_file);
-            return FALSE;
+            goto fail;
         }
     }
 
     gsize group_count = 0;
-    gchar **groups = g_key_file_get_groups(key_file, &group_count);
-    GPtrArray *rules = g_ptr_array_new_with_free_func(
+    groups = g_key_file_get_groups(key_file, &group_count);
+    rules = g_ptr_array_new_with_free_func(
         (GDestroyNotify) credential_rule_free);
     for (gsize index = 0; index < group_count; index++) {
         const gchar *group = groups[index];
@@ -166,11 +178,7 @@ gboolean app_config_load(AppConfig *config, const gchar *path, GError **error)
         if (*id == '\0' || strlen(id) > 64U) {
             g_set_error(error, G_KEY_FILE_ERROR, G_KEY_FILE_ERROR_INVALID_VALUE,
                         "invalid credential group name");
-            g_ptr_array_unref(rules);
-            g_strfreev(groups);
-            g_free(profile_directory);
-            g_key_file_unref(key_file);
-            return FALSE;
+            goto fail;
         }
 
         CredentialRule *rule = g_new0(CredentialRule, 1);
@@ -180,33 +188,21 @@ gboolean app_config_load(AppConfig *config, const gchar *path, GError **error)
             !get_required_key(key_file, group, "auth-file",
                               &rule->auth_file, error)) {
             credential_rule_free(rule);
-            g_ptr_array_unref(rules);
-            g_strfreev(groups);
-            g_free(profile_directory);
-            g_key_file_unref(key_file);
-            return FALSE;
+            goto fail;
         }
         if (strlen(rule->pattern) > MAX_REGEX_BYTES ||
             !g_path_is_absolute(rule->auth_file)) {
             g_set_error(error, G_KEY_FILE_ERROR, G_KEY_FILE_ERROR_INVALID_VALUE,
                         "invalid credential rule %s", rule->id);
             credential_rule_free(rule);
-            g_ptr_array_unref(rules);
-            g_strfreev(groups);
-            g_free(profile_directory);
-            g_key_file_unref(key_file);
-            return FALSE;
+            goto fail;
         }
         rule->regex = g_regex_new(rule->pattern, G_REGEX_CASELESS | G_REGEX_OPTIMIZE,
                                   0, &local_error);
         if (rule->regex == NULL) {
             g_propagate_error(error, local_error);
             credential_rule_free(rule);
-            g_ptr_array_unref(rules);
-            g_strfreev(groups);
-            g_free(profile_directory);
-            g_key_file_unref(key_file);
-            return FALSE;
+            goto fail;
         }
         g_ptr_array_add(rules, rule);
     }
@@ -214,14 +210,41 @@ gboolean app_config_load(AppConfig *config, const gchar *path, GError **error)
     g_free(config->profile_directory);
     config->profile_directory = profile_directory != NULL
         ? profile_directory : g_strdup(DEFAULT_PROFILE_DIRECTORY);
+    profile_directory = NULL;
     g_clear_pointer(&config->credential_rules, g_ptr_array_unref);
     config->credential_rules = rules;
+    rules = NULL;
 
     g_strfreev(groups);
+    groups = NULL;
     g_key_file_unref(key_file);
     return TRUE;
+
+fail:
+    if (rules != NULL) {
+        g_ptr_array_unref(rules);
+    }
+    if (groups != NULL) {
+        g_strfreev(groups);
+    }
+    g_free(profile_directory);
+    if (key_file_data != NULL) {
+        g_string_free(key_file_data, TRUE);
+    }
+    g_key_file_unref(key_file);
+    return FALSE;
 }
 
+/**
+ * trimmed_line:
+ * @line: raw line from a profile file
+ *
+ * Strips whitespace and comments. Comment markers (# or ;) must be preceded
+ * by whitespace or start the trimmed line.
+ *
+ * Returns: (nullable): a newly allocated directive line, or %NULL when empty
+ *   or comment-only
+ */
 static gchar *trimmed_line(const gchar *line)
 {
     gchar *copy = g_strdup(line);
@@ -242,6 +265,45 @@ static gchar *trimmed_line(const gchar *line)
     return copy;
 }
 
+/**
+ * compact_line_tokens:
+ * @line: whitespace-delimited line
+ * @tokens: (out): newly allocated %NULL-terminated token array
+ * @token_count: (out): number of tokens excluding the trailing %NULL
+ *
+ * Splits @line on whitespace and discards empty tokens.
+ *
+ * Returns: %TRUE when at least one token was found
+ */
+static gboolean compact_line_tokens(const gchar *line, gchar ***tokens,
+                                    gsize *token_count)
+{
+    gchar **split = g_strsplit_set(line, " \t\r", -1);
+    GPtrArray *compact = g_ptr_array_new_with_free_func(g_free);
+    for (gsize token_index = 0; split[token_index] != NULL; token_index++) {
+        if (*split[token_index] != '\0') {
+            g_ptr_array_add(compact, g_strdup(split[token_index]));
+        }
+    }
+    g_strfreev(split);
+    if (compact->len == 0U) {
+        g_ptr_array_unref(compact);
+        *tokens = NULL;
+        *token_count = 0;
+        return FALSE;
+    }
+    g_ptr_array_add(compact, NULL);
+    *token_count = compact->len - 1U;
+    *tokens = (gchar **) g_ptr_array_free(compact, FALSE);
+    return TRUE;
+}
+
+/**
+ * is_rejected_directive:
+ * @directive: lower-case OpenVPN directive name
+ *
+ * Returns: %TRUE when @directive is blocked for security reasons
+ */
 static gboolean is_rejected_directive(const gchar *directive)
 {
     static const gchar *const rejected[] = {
@@ -262,6 +324,15 @@ static gboolean is_rejected_directive(const gchar *directive)
     return FALSE;
 }
 
+/**
+ * parse_remote_hostname:
+ * @tokens: whitespace-split `remote` directive tokens
+ * @token_count: number of entries in @tokens
+ *
+ * Extracts the hostname argument from a `remote` directive.
+ *
+ * Returns: (nullable): newly allocated hostname on success
+ */
 static gchar *parse_remote_hostname(gchar **tokens, gsize token_count)
 {
     if (token_count < 2U || token_count > 4U) {
@@ -291,6 +362,14 @@ static gchar *parse_remote_hostname(gchar **tokens, gsize token_count)
     return hostname;
 }
 
+/**
+ * set_profile_error:
+ * @profile: profile receiving the error
+ * @format: printf-style error message format
+ * @...: printf arguments
+ *
+ * Replaces any existing @profile error with a newly formatted message.
+ */
 static void set_profile_error(Profile *profile, const gchar *format, ...)
 {
     va_list arguments;
@@ -317,9 +396,8 @@ Profile *profile_parse(const gchar *path, const gchar *display_name)
     }
 
     gchar *contents = NULL;
-    gsize length = 0;
     GError *error = NULL;
-    if (!g_file_get_contents(path, &contents, &length, &error)) {
+    if (!g_file_get_contents(path, &contents, NULL, &error)) {
         set_profile_error(profile, "cannot read profile: %s", error->message);
         g_clear_error(&error);
         return profile;
@@ -336,35 +414,31 @@ Profile *profile_parse(const gchar *path, const gchar *display_name)
         if (line == NULL) {
             continue;
         }
-        gchar **tokens = g_strsplit_set(line, " \t\r", -1);
-        GPtrArray *compact = g_ptr_array_new_with_free_func(g_free);
-        for (gsize token_index = 0; tokens[token_index] != NULL; token_index++) {
-            if (*tokens[token_index] != '\0') {
-                g_ptr_array_add(compact, g_strdup(tokens[token_index]));
-            }
+        gchar **values = NULL;
+        gsize token_count = 0;
+        if (!compact_line_tokens(line, &values, &token_count)) {
+            g_free(line);
+            continue;
         }
-        g_ptr_array_add(compact, NULL);
-        if (compact->len > 1U) {
-            gchar **values = (gchar **) compact->pdata;
+        if (token_count > 0U) {
             gchar *directive = g_ascii_strdown(values[0], -1);
             if (is_rejected_directive(directive)) {
                 set_profile_error(profile, "unsupported directive: %s", directive);
             } else if (g_strcmp0(directive, "remote") == 0) {
                 remote_count++;
                 if (remote_count == 1U) {
-                    profile->hostname = parse_remote_hostname(values, compact->len - 1U);
+                    profile->hostname = parse_remote_hostname(values, token_count);
                     if (profile->hostname == NULL) {
                         set_profile_error(profile, "invalid remote directive");
                     }
                 }
             } else if (g_strcmp0(directive, "verify-x509-name") == 0 &&
-                       compact->len > 2U && g_str_has_prefix(values[1], "CN=")) {
+                       token_count > 1U && g_str_has_prefix(values[1], "CN=")) {
                 profile->credential_hostname = g_strdup(values[1] + 3);
             }
             g_free(directive);
         }
-        g_ptr_array_unref(compact);
-        g_strfreev(tokens);
+        g_strfreev(values);
         g_free(line);
         if (profile->error != NULL) {
             break;
@@ -378,10 +452,17 @@ Profile *profile_parse(const gchar *path, const gchar *display_name)
 
     g_strfreev(lines);
     g_free(contents);
-    (void) length;
     return profile;
 }
 
+/**
+ * apply_credential_mapping:
+ * @profile: parsed profile to update
+ * @config: credential rules to match against
+ *
+ * Sets credential_id and auth_file on @profile when exactly one rule matches
+ * hostname, verify-x509-name CN, or display name.
+ */
 static void apply_credential_mapping(Profile *profile, const AppConfig *config)
 {
     if (profile->error != NULL || profile->hostname == NULL) {
@@ -418,6 +499,15 @@ static void apply_credential_mapping(Profile *profile, const AppConfig *config)
     profile->auth_file = g_strdup(match->auth_file);
 }
 
+/**
+ * profile_compare:
+ * @first: pointer to a #Profile
+ * @second: pointer to a #Profile
+ *
+ * Compares profiles by display name for sorting.
+ *
+ * Returns: negative, zero, or positive as for strcmp()
+ */
 static gint profile_compare(gconstpointer first, gconstpointer second)
 {
     const Profile *left = *(Profile *const *) first;
@@ -479,7 +569,8 @@ gboolean profile_matches(const Profile *profile, const gchar *query)
     }
     gchar *folded_query = g_utf8_casefold(query, -1);
     gchar *folded_name = g_utf8_casefold(profile->display_name, -1);
-    gchar *folded_host = g_utf8_casefold(profile->hostname != NULL ? profile->hostname : "", -1);
+    const gchar *hostname = profile->hostname != NULL ? profile->hostname : "";
+    gchar *folded_host = g_utf8_casefold(hostname, -1);
     gboolean result = g_strstr_len(folded_name, -1, folded_query) != NULL ||
         g_strstr_len(folded_host, -1, folded_query) != NULL;
     g_free(folded_query);
@@ -488,6 +579,18 @@ gboolean profile_matches(const Profile *profile, const gchar *query)
     return result;
 }
 
+/**
+ * profiles_filter_internal:
+ * @profiles: source profile array
+ * @query: case-insensitive search string
+ * @maximum: maximum number of matches to collect
+ * @cancellable: optional cancellation object
+ * @total_matches: (out) (optional): total matches before truncation
+ *
+ * Shared implementation for profiles_filter() and profiles_filter_cancelable().
+ *
+ * Returns: (nullable): matching profile pointers, or %NULL on cancellation
+ */
 static GPtrArray *profiles_filter_internal(const GPtrArray *profiles,
                                             const gchar *query, guint maximum,
                                             GCancellable *cancellable,
@@ -535,6 +638,12 @@ gboolean profile_is_connectable(const Profile *profile)
         profile->credential_id != NULL && profile->auth_file != NULL;
 }
 
+/**
+ * path_component_secure:
+ * @path: directory path component
+ *
+ * Returns: %TRUE when @path is a root-owned directory without group/other write
+ */
 static gboolean path_component_secure(const gchar *path)
 {
     struct stat metadata;
@@ -548,7 +657,7 @@ static gboolean path_component_secure(const gchar *path)
 gboolean path_is_secure_file(const gchar *path)
 {
     if (path == NULL || !g_path_is_absolute(path) ||
-        !g_str_has_prefix(path, "/etc/openvpn/")) {
+        !g_str_has_prefix(path, OPENVPN_ETC_PREFIX)) {
         return FALSE;
     }
     struct stat metadata;
