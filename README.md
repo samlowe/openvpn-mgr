@@ -1,8 +1,8 @@
 # OpenVPN Manager
 
-A small native C/GTK desktop frontend for direct OpenVPN connections. It does not use NetworkManager and does not use Python.
+A small native C/GTK desktop frontend for direct OpenVPN connections. It does not use NetworkManager.
 
-Written to allow the author to easily use NordVPN from Ubuntu without using the official NordVPN client
+Written to allow the author to easily use NordVPN from Ubuntu without using the official NordVPN client. Uses lightweight/naive approached by design.
 
 ## What it does
 
