@@ -2,6 +2,8 @@
 
 A small native C/GTK desktop frontend for direct OpenVPN connections. It does not use NetworkManager and does not use Python.
 
+Written to allow the author to easily use NordVPN from Ubuntu without using the official NordVPN client
+
 ## What it does
 
 - Displays the window immediately, then scans profiles in a worker thread.
