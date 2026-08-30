@@ -1,0 +1,43 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(make:*)",
+      "Subagent(*)"
+    ],
+    "deny": [
+      "Bash(git commit:*)",
+      "Bash(git push:*)",
+      "Bash(git merge:*)",
+      "Bash(git rebase:*)",
+      "Bash(git reset:*)",
+      "Bash(git add:*)",
+      "Bash(git stash:*)",
+      "Read(.env)",
+      "Read(.env.local)",
+      "Read(/secrets/)",
+      "Read(.cache)",
+      "Read(.claude/backups/)"
+    ],
+    "ask": [
+      "Bash(mv:*)",
+      "Bash(rm:*)",
+      "Bash(ls -R:*)",
+      "Bash(find /:*)"
+    ]
+  },
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "execute_command",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "jq -r .tool_input.command | .claude/validate_bash.sh",
+            "timeout": 15.0,
+            "onError": "deny"
+          }
+        ]
+      }
+    ]
+  }
+}
