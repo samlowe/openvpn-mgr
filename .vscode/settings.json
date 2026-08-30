@@ -2,5 +2,10 @@
   "C_Cpp.default.configurationProvider": "",
   "C_Cpp.default.compileCommands": "${workspaceFolder}/compile_commands.json",
   "C_Cpp.default.cStandard": "c11",
-  "C_Cpp.default.intelliSenseMode": "linux-gcc-x64"
+  "C_Cpp.default.intelliSenseMode": "linux-gcc-x64",
+  "files.associations": {
+    "*.ejs": "html",
+    "*.css": "tailwindcss",
+    "gtk.h": "c"
+  }
 }
