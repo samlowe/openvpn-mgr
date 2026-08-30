@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=OpenVPN Manager
+Comment=Small direct OpenVPN endpoint manager
+Exec=openvpn-manager
+Icon=network-vpn
+Terminal=false
+Categories=Network;GTK;
+StartupNotify=true
