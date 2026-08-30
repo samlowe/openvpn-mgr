@@ -1,0 +1,20 @@
+# Makefile build outputs
+/openvpn-manager
+/test_core
+*.o
+
+# Optional tooling (bear, compiledb, clangd)
+compile_commands.json
+.cache/
+
+# Editor / OS cruft
+*~
+*.swp
+*.swo
+.DS_Store
+
+# Agent hooks (local overrides and generated files)
+.claude/backups
+.claude/settings.local.json
+.claude/__pycache__/
+.stratacode/settings.local.json
